@@ -16,3 +16,5 @@ out/
 build/
 .vercel/
 vercel.json.bak
+.vercel
+.env*

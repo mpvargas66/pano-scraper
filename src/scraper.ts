@@ -1,137 +1,167 @@
 import "dotenv/config";
-import { db } from "./db";
-import { events } from "./db/schema";
-import { eq } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/postgres-js";
+import postgres from "postgres";
+import { pgTable, uuid, text, doublePrecision, timestamp, pgEnum, integer, boolean, numeric } from "drizzle-orm/pg-core";
+import { eq, and } from "drizzle-orm";
 import { scrapeTicketmaster } from "./scrapers/ticketmaster";
-import { scrapeEventbrite } from "./scrapers/eventbrite";
-import { scrapeFinde } from "./scrapers/finde";
 import { geocodeLocation } from "./utils/geocoding";
-import { eventExists, deduplicateEvents } from "./utils/dedup";
-import { RawEventData } from "./types";
 
-/**
- * Main scraper function
- * Executes all scrapers and saves unique events to database
- */
+const DATABASE_URL = process.env.DATABASE_URL!;
+const client = postgres(DATABASE_URL, { ssl: "require", max: 1 });
+const db = drizzle(client);
+
+// Schema real de pano-web
+const categoryEnum = pgEnum("category", ["gastro","musica","arte","bienestar","cine","familiar","bar","discoteca"]);
+const eventStatusEnum = pgEnum("event_status", ["draft","published","archived"]);
+
+const venues = pgTable("venues", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  name: text("name").notNull(),
+  address: text("address"),
+  zone: text("zone"),
+  region: text("region"),
+  comuna: text("comuna"),
+  lat: doublePrecision("lat").notNull(),
+  lng: doublePrecision("lng").notNull(),
+  googlePlaceId: text("google_place_id"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+const events = pgTable("events", {
+  id: uuid("id").defaultRandom().primaryKey(),
+  slug: text("slug").notNull().unique(),
+  titleEs: text("title_es").notNull(),
+  titleEn: text("title_en").notNull(),
+  descriptionEs: text("description_es"),
+  descriptionEn: text("description_en"),
+  category: categoryEnum("category").notNull(),
+  venueId: uuid("venue_id"),
+  startAt: timestamp("start_at", { withTimezone: true }).notNull(),
+  endAt: timestamp("end_at", { withTimezone: true }),
+  priceClp: integer("price_clp").notNull().default(0),
+  petFriendly: boolean("pet_friendly").notNull().default(false),
+  family: boolean("family").notNull().default(false),
+  nightlife: boolean("nightlife").notNull().default(false),
+  imageUrl: text("image_url"),
+  status: eventStatusEnum("status").notNull().default("published"),
+  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+});
+
+// Mapeo de categorías del scraper al enum real
+function mapCategory(scraperCategory: string): "gastro"|"musica"|"arte"|"bienestar"|"cine"|"familiar"|"bar"|"discoteca" {
+  const map: Record<string, any> = {
+    "música": "musica",
+    "Gastronomía": "gastro",
+    "arte": "arte",
+    "bienestar": "bienestar",
+    "cine": "cine",
+    "familiar": "familiar",
+    "bar": "bar",
+    "discoteca": "discoteca",
+    "otro": "musica", // fallback
+  };
+  return map[scraperCategory] || "musica";
+}
+
+// Genera un slug único
+function generateSlug(name: string, date: Date): string {
+  const base = name
+    .toLowerCase()
+    .normalize("NFD").replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .slice(0, 60);
+  const dateStr = date.toISOString().split("T")[0];
+  return `${base}-${dateStr}`;
+}
+
 export async function runScraper() {
   console.log("🚀 Starting Pano Panoramas scraper...");
   const startTime = Date.now();
 
-  try {
-    // Run all scrapers in parallel
-    const [ticketmasterResult, eventbriteResult, findeResult] = await Promise.all(
-      [
-        scrapeTicketmaster(),
-        scrapeEventbrite(),
-        scrapeFinde(),
-      ]
-    );
+  const ticketmasterResult = await scrapeTicketmaster();
+  console.log(`\n📊 Scraping Results:`);
+  console.log(`  Ticketmaster: ${ticketmasterResult.eventsCount} events`);
 
-    console.log("\n📊 Scraping Results:");
-    console.log(`  Ticketmaster: ${ticketmasterResult.eventsCount} events`);
-    console.log(`  Eventbrite: ${eventbriteResult.eventsCount} events`);
-    console.log(`  Finde: ${findeResult.eventsCount} events`);
+  const allEvents = [...ticketmasterResult.events];
+  let insertedCount = 0;
+  let skippedCount = 0;
 
-    // Combine and deduplicate
-    const allEvents = [
-      ...ticketmasterResult.events,
-      ...eventbriteResult.events,
-      ...findeResult.events,
-    ];
+  for (const rawEvent of allEvents) {
+    try {
+      const slug = generateSlug(rawEvent.name, rawEvent.startDate);
 
-    const dedupedEvents = deduplicateEvents(allEvents);
-    console.log(`\n✨ After deduplication: ${dedupedEvents.length} events`);
-
-    // Process and save events
-    let insertedCount = 0;
-    let skippedCount = 0;
-
-    for (const rawEvent of dedupedEvents) {
-      try {
-        // Check if event already exists
-        const exists = await eventExists(
-          rawEvent.sourceEventId || "",
-          rawEvent.sourceType,
-          rawEvent.name,
-          rawEvent.startDate
-        );
-
-        if (exists) {
-          skippedCount++;
-          continue;
-        }
-
-        // Geocode location if not already provided
-        let latitude = rawEvent.latitude;
-        let longitude = rawEvent.longitude;
-
-        if (!latitude || !longitude) {
-          const geoResult = await geocodeLocation(rawEvent.location);
-          if (geoResult) {
-            latitude = geoResult.latitude;
-            longitude = geoResult.longitude;
-          }
-        }
-
-        // Insert event
-        await db.insert(events).values({
-          name: rawEvent.name,
-          description: rawEvent.description,
-          category: rawEvent.category,
-          type: rawEvent.type,
-          price: {
-            isFree: rawEvent.price.isFree,
-            minPrice: rawEvent.price.minPrice,
-            maxPrice: rawEvent.price.maxPrice,
-            currency: rawEvent.price.currency,
-          },
-          minAge: rawEvent.minAge,
-          location: rawEvent.location,
-          latitude: latitude ? Math.round(latitude * 1000000) / 1000000 : null,
-          longitude: longitude ? Math.round(longitude * 1000000) / 1000000 : null,
-          startDate: rawEvent.startDate,
-          endDate: rawEvent.endDate,
-          schedules: rawEvent.schedules || null,
-          imageUrl: rawEvent.imageUrl,
-          sourceUrl: rawEvent.sourceUrl,
-          sourceType: rawEvent.sourceType,
-          sourceEventId: rawEvent.sourceEventId,
-        });
-
-        insertedCount++;
-      } catch (err) {
-        console.error(`Error inserting event "${rawEvent.name}":`, err);
+      // Verificar si ya existe por slug
+      const existing = await db.select().from(events).where(eq(events.slug, slug)).limit(1);
+      if (existing.length > 0) {
+        skippedCount++;
+        continue;
       }
+
+      // Obtener o crear venue
+      let venueId: string | null = null;
+      let lat = rawEvent.latitude || 0;
+      let lng = rawEvent.longitude || 0;
+
+      // Geocodificar si no tiene coordenadas
+      if (!lat || !lng) {
+        const geo = await geocodeLocation(rawEvent.location);
+        if (geo) { lat = geo.latitude; lng = geo.longitude; }
+      }
+
+      if (lat && lng) {
+        // Buscar venue existente por nombre
+        const existingVenue = await db.select().from(venues)
+          .where(eq(venues.name, rawEvent.location)).limit(1);
+
+        if (existingVenue.length > 0) {
+          venueId = existingVenue[0].id;
+        } else {
+          // Crear nuevo venue
+          const newVenue = await db.insert(venues).values({
+            name: rawEvent.location,
+            lat,
+            lng,
+            region: "Región Metropolitana",
+          }).returning();
+          venueId = newVenue[0].id;
+        }
+      }
+
+      // Insertar evento
+      await db.insert(events).values({
+        slug,
+        titleEs: rawEvent.name,
+        titleEn: rawEvent.name,
+        descriptionEs: rawEvent.description,
+        descriptionEn: rawEvent.description,
+        category: mapCategory(rawEvent.category),
+        venueId,
+        startAt: rawEvent.startDate,
+        endAt: rawEvent.endDate,
+        priceClp: rawEvent.price.isFree ? 0 : (rawEvent.price.minPrice || 0),
+        family: rawEvent.category === "familiar",
+        nightlife: rawEvent.category === "bar" || rawEvent.category === "discoteca",
+        imageUrl: rawEvent.imageUrl,
+        status: "published",
+      });
+
+      insertedCount++;
+      console.log(`  ✅ Inserted: ${rawEvent.name}`);
+    } catch (err) {
+      console.error(`  ❌ Error inserting "${rawEvent.name}":`, err);
     }
-
-    const endTime = Date.now();
-    const duration = ((endTime - startTime) / 1000).toFixed(2);
-
-    console.log(`\n✅ Scraper completed successfully!`);
-    console.log(`  Inserted: ${insertedCount} new events`);
-    console.log(`  Skipped: ${skippedCount} existing events`);
-    console.log(`  Duration: ${duration}s`);
-
-    return {
-      success: true,
-      inserted: insertedCount,
-      skipped: skippedCount,
-      total: dedupedEvents.length,
-    };
-  } catch (error) {
-    console.error("❌ Scraper failed:", error);
-    throw error;
   }
+
+  const duration = ((Date.now() - startTime) / 1000).toFixed(2);
+  console.log(`\n✅ Scraper completed!`);
+  console.log(`  Inserted: ${insertedCount} new events`);
+  console.log(`  Skipped: ${skippedCount} existing events`);
+  console.log(`  Duration: ${duration}s`);
+
+  return { success: true, inserted: insertedCount, skipped: skippedCount, total: allEvents.length };
 }
 
-// Run scraper if executed directly
 if (require.main === module) {
-  runScraper()
-    .then(() => {
-      process.exit(0);
-    })
-    .catch((err) => {
-      console.error(err);
-      process.exit(1);
-    });
+  runScraper().then(() => process.exit(0)).catch((err) => { console.error(err); process.exit(1); });
 }
