@@ -139,7 +139,9 @@ export async function runScraper() {
         venueId,
         startAt: rawEvent.startDate,
         endAt: rawEvent.endDate,
-        priceClp: rawEvent.price.isFree ? 0 : (rawEvent.price.minPrice || 0),
+        priceClp: rawEvent.price.minPrice
+          ? Math.round(rawEvent.price.minPrice * 950)
+          : -1,
         family: rawEvent.category === "familiar",
         nightlife: rawEvent.category === "bar" || rawEvent.category === "discoteca",
         imageUrl: rawEvent.imageUrl,
