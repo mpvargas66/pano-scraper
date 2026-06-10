@@ -1,18 +1,7 @@
-import { runScraper } from "../../scraper";
-import { VercelRequest, VercelResponse } from "@vercel/node";
+import { runScraper } from "../../src/scraper";
+import type { VercelRequest, VercelResponse } from "@vercel/node";
 
-/**
- * Vercel Cron job handler
- * Configured in vercel.json to run daily at 00:00 UTC
- * 
- * Usage:
- *   curl https://your-domain.vercel.app/api/cron/scrape
- */
-export default async function handler(
-  req: VercelRequest,
-  res: VercelResponse
-) {
-  // Verify request comes from Vercel (production)
+export default async function handler(req: VercelRequest, res: VercelResponse) {
   const authHeader = req.headers.authorization;
   const expectedToken = process.env.CRON_SECRET;
 
@@ -28,7 +17,6 @@ export default async function handler(
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    console.error("Cron handler error:", error);
     return res.status(500).json({
       success: false,
       error: String(error),
