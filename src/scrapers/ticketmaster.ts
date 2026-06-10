@@ -1,125 +1,89 @@
 import axios from "axios";
-import { RawEventData, EventCategory, EventType, ScraperResult } from "../types";
+import { RawEventData, EventCategory, ScraperResult } from "../types";
 
 const TICKETMASTER_API_KEY = process.env.TICKETMASTER_API_KEY;
 
-// Category mapping from Ticketmaster classifications
 const CLASSIFICATION_MAP: Record<string, EventCategory> = {
   music: "música",
   concert: "música",
-  sports: "otro",
   theater: "arte",
   arts: "arte",
   comedy: "arte",
   family: "familiar",
   food: "Gastronomía",
-  dining: "Gastronomía",
   wellness: "bienestar",
   film: "cine",
   movie: "cine",
-  entertainment: "otro",
 };
 
-async function mapClassificationToCategory(
-  classificationName: string
-): Promise<EventCategory> {
-  const normalized = classificationName.toLowerCase();
-  
-  for (const [key, category] of Object.entries(CLASSIFICATION_MAP)) {
-    if (normalized.includes(key)) {
-      return category;
-    }
+function mapCategory(name: string): EventCategory {
+  const n = name.toLowerCase();
+  for (const [key, cat] of Object.entries(CLASSIFICATION_MAP)) {
+    if (n.includes(key)) return cat;
   }
-
   return "otro";
 }
 
 export async function scrapeTicketmaster(): Promise<ScraperResult> {
   if (!TICKETMASTER_API_KEY) {
-    return {
-      source: "ticketmaster",
-      success: false,
-      eventsCount: 0,
-      events: [],
-      error: "TICKETMASTER_API_KEY not configured",
-    };
+    return { source: "ticketmaster", success: false, eventsCount: 0, events: [], error: "No API key" };
   }
 
   try {
-    // Search events in Chile (countryCode: CL)
-    // Radius search around Santiago (RM)
+    const now = new Date();
+    const future = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000); // 90 días
+
     const response = await axios.get(
       "https://app.ticketmaster.com/discovery/v2/events.json",
       {
         params: {
           countryCode: "CL",
-          size: 50, // Max 50 per page
+          size: 100,
           apikey: TICKETMASTER_API_KEY,
-          startDateTime: new Date().toISOString().split(".")[0] + "Z",
-          endDateTime: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split(".")[0] + "Z",
+          startDateTime: now.toISOString().replace(".000", ""),
+          endDateTime: future.toISOString().replace(".000", ""),
+          sort: "date,asc",
         },
       }
     );
 
-    const rawEvents = response.data._embedded?.events || [];
+    const rawEvents = response.data?._embedded?.events || [];
     const events: RawEventData[] = [];
 
-    for (const rawEvent of rawEvents) {
+    for (const e of rawEvents) {
       try {
-        const classifications = rawEvent.classifications || [];
-        const genre = classifications[0]?.genre?.name || "entertainment";
-        const category = await mapClassificationToCategory(genre);
+        const genre = e.classifications?.[0]?.genre?.name || "entertainment";
+        const category = mapCategory(genre);
+        const priceRanges = e.priceRanges || [];
+        const isFree = priceRanges.length === 0;
 
-        // Parse price
-        const priceRanges = rawEvent.priceRanges || [];
-        const isFree = priceRanges.length === 0 || priceRanges[0]?.min === 0;
-        const minPrice = priceRanges[0]?.min || undefined;
-        const maxPrice = priceRanges[0]?.max || undefined;
-
-        const event: RawEventData = {
-          name: rawEvent.name,
-          description: rawEvent.description,
+        events.push({
+          name: e.name,
+          description: e.info || e.pleaseNote,
           category,
-          type: "único" as EventType,
+          type: "único",
           price: {
             isFree,
-            minPrice,
-            maxPrice,
+            minPrice: priceRanges[0]?.min,
+            maxPrice: priceRanges[0]?.max,
             currency: "CLP",
           },
-          minAge: undefined, // Ticketmaster doesn't provide this directly
-          location: rawEvent._embedded?.venues?.[0]?.name || "TBD",
-          latitude: parseFloat(rawEvent._embedded?.venues?.[0]?.location?.latitude || "0") || undefined,
-          longitude: parseFloat(rawEvent._embedded?.venues?.[0]?.location?.longitude || "0") || undefined,
-          startDate: new Date(rawEvent.dates.start.dateTime),
-          endDate: rawEvent.dates.end ? new Date(rawEvent.dates.end.dateTime) : undefined,
-          imageUrl: rawEvent.images?.[0]?.url,
-          sourceUrl: rawEvent.url,
+          location: e._embedded?.venues?.[0]?.name || "Santiago",
+          latitude: parseFloat(e._embedded?.venues?.[0]?.location?.latitude) || undefined,
+          longitude: parseFloat(e._embedded?.venues?.[0]?.location?.longitude) || undefined,
+          startDate: new Date(e.dates?.start?.dateTime || e.dates?.start?.localDate),
+          imageUrl: e.images?.[0]?.url,
+          sourceUrl: e.url,
           sourceType: "ticketmaster",
-          sourceEventId: rawEvent.id,
-        };
-
-        events.push(event);
+          sourceEventId: e.id,
+        });
       } catch (err) {
-        console.error(`Error mapping Ticketmaster event: ${err}`);
         continue;
       }
     }
 
-    return {
-      source: "ticketmaster",
-      success: true,
-      eventsCount: events.length,
-      events,
-    };
+    return { source: "ticketmaster", success: true, eventsCount: events.length, events };
   } catch (error) {
-    console.error("Ticketmaster scraping error:", error);
-    return {
-      source: "ticketmaster",
-      success: false,
-      eventsCount: 0,
-      events: [],
-      error: String(error),
-    };
+    return { source: "ticketmaster", success: false, eventsCount: 0, events: [], error: String(error) };
   }
 }
